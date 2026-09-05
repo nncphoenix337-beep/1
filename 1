@@ -1,31 +1,11 @@
 # ================================================================
-# AI MT5 TRADER
-# SMC ENGINE V4.3.9
-#
+# AI MT5 TRADER - SMC ENGINE V4.3.11
 # SMART MONEY CONCEPT ONLY
-#
-# H4  = EXTERNAL MAPPING
-# H1  = MAPPING / POI
-# M15 = SETUP
-# M5  = ENTRY CONFIRMATION
-#
-# NO EMA
-# NO RSI
-# NO MACD
-# NO ATR
-#
-# CLOSED CANDLES ONLY
-# CAUSAL SWINGS
-# PERSISTENT POI
-# NO POI AGE EXPIRATION
-#
-# M5 ENTRY MUST TOUCH M15 POI
-#
+# H4 = MAPPING | H1 = MAPPING/POI | M15 = SETUP | M5 = CONFIRM
+# CLOSED CANDLES ONLY | CAUSAL EVENTS | PERSISTENT POI
 # ================================================================
 
-import sys
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Optional, List, Dict
 
 import numpy as np
@@ -44,32 +24,45 @@ H1_BARS = 1600
 M15_BARS = 3500
 M5_BARS = 10000
 
+# Causal swing confirmation
 SWING_LEFT = 3
 SWING_RIGHT = 3
 
+# Liquidity
 LIQUIDITY_TOLERANCE = 1.50
 
+# M15 sequence
 MAX_STRUCTURE_AFTER_SWEEP = 20
 MAX_DISPLACEMENT_AFTER_STRUCTURE = 8
 MAX_POI_AFTER_DISPLACEMENT = 8
 
+# M5 sequence
 M5_CONFIRM_LOOKBACK = 150
 M5_MAX_CONFIRM_BARS = 50
+M5_LOCAL_LOOKBACK = 12
 
+# Displacement
 DISPLACEMENT_BODY_RATIO = 0.65
 DISPLACEMENT_RANGE_MULTIPLIER = 1.15
 DISPLACEMENT_LOOKBACK = 10
 
+# FVG
 MIN_FVG_SIZE = 0.20
-OB_LOOKBACK = 8
 
-POI_TOUCH_TOLERANCE = 0.30
+# Order Block
+OB_LOOKBACK = 6
 
-# Local liquidity detection on M5
-M5_LOCAL_LOOKBACK = 12
-
-# A confirmation must remain reasonably close to the M15 POI.
+# POI validation
+POI_TOUCH_TOLERANCE = 0.05
 MAX_M5_DISTANCE_FROM_POI = 3.00
+MAX_POI_DISPLACEMENT_GAP = 8.00
+MIN_ZONE_OVERLAP = 0.01
+
+# M5 touch validation
+MAX_TOUCH_RANGE_MULTIPLIER = 3.0
+MAX_TOUCH_RANGE_ABSOLUTE = 20.0
+MAX_TOUCH_CLOSE_DISTANCE_MULTIPLIER = 3.0
+MAX_TOUCH_CLOSE_DISTANCE_ABSOLUTE = 5.0
 
 
 # ================================================================
@@ -122,27 +115,23 @@ class Zone:
 
 
 # ================================================================
-# UTILITY
+# HELPERS
 # ================================================================
 
 def safe_float(value, default=0.0):
-
     try:
+        result = float(value)
 
-        value = float(value)
-
-        if np.isnan(value):
+        if np.isnan(result):
             return default
 
-        return value
+        return result
 
     except Exception:
-
         return default
 
 
 def fmt_price(value):
-
     if value is None:
         return "-"
 
@@ -150,18 +139,13 @@ def fmt_price(value):
 
 
 def fmt_time(value):
-
     if value is None:
         return "-"
 
     try:
-
-        return pd.Timestamp(value).strftime(
-            "%Y-%m-%d %H:%M"
-        )
+        return pd.Timestamp(value).strftime("%Y-%m-%d %H:%M")
 
     except Exception:
-
         return str(value)
 
 
@@ -171,55 +155,47 @@ def fmt_time(value):
 
 class SMCEngine:
 
-    def __init__(
-        self,
-        timeframe: str,
-        df: pd.DataFrame
-    ):
+    def __init__(self, timeframe: str, df: pd.DataFrame):
 
         self.timeframe = timeframe
 
-        self.df = self._prepare_data(
-            df
-        )
+        self.df = self._prepare_data(df)
 
-        self.swings_high = []
-        self.swings_low = []
+        self.swings_high: List[SwingPoint] = []
+        self.swings_low: List[SwingPoint] = []
 
-        self.structure = []
-        self.events = []
+        self.structure: List[StructureEvent] = []
+        self.events: List[StructureEvent] = []
 
-        self.liquidity = []
+        self.liquidity: List[LiquidityPool] = []
 
-        self.fvg_zones = []
-        self.ob_zones = []
-        self.zones = []
+        self.fvg_zones: List[Zone] = []
+        self.ob_zones: List[Zone] = []
+
+        self.zones: List[Zone] = []
 
         self.bias = "NEUTRAL"
 
         self.protected_high = None
         self.protected_low = None
 
+
     # ============================================================
-    # PREPARE
+    # DATA PREPARATION
     # ============================================================
 
-    def _prepare_data(
-        self,
-        df
-    ):
+    def _prepare_data(self, df):
 
         if df is None or len(df) == 0:
-
             raise ValueError(
-                f"{self.timeframe}: dataframe kosong."
+                f"{self.timeframe}: dataframe kosong"
             )
 
-        data = df.copy()
+        d = df.copy()
 
-        data.columns = [
+        d.columns = [
             str(c).lower().strip()
-            for c in data.columns
+            for c in d.columns
         ]
 
         required = [
@@ -230,162 +206,155 @@ class SMCEngine:
             "close"
         ]
 
-        for col in required:
+        missing = [
+            c for c in required
+            if c not in d.columns
+        ]
 
-            if col not in data.columns:
+        if missing:
+            raise ValueError(
+                f"{self.timeframe}: kolom hilang {missing}"
+            )
 
-                raise ValueError(
-                    f"{self.timeframe}: "
-                    f"kolom {col} tidak ditemukan."
-                )
-
-        data["time"] = pd.to_datetime(
-            data["time"],
+        d["time"] = pd.to_datetime(
+            d["time"],
             errors="coerce"
         )
 
-        for col in [
+        for column in [
             "open",
             "high",
             "low",
             "close"
         ]:
 
-            data[col] = pd.to_numeric(
-                data[col],
+            d[column] = pd.to_numeric(
+                d[column],
                 errors="coerce"
             )
 
-        data = data.dropna(
-            subset=[
-                "time",
-                "open",
-                "high",
-                "low",
-                "close"
-            ]
-        )
-
-        data = (
-            data
+        d = (
+            d
+            .dropna(subset=required)
             .sort_values("time")
             .drop_duplicates("time")
             .reset_index(drop=True)
         )
 
-        data["bull"] = (
-            data["close"] > data["open"]
+        d["bull"] = d["close"] > d["open"]
+        d["bear"] = d["close"] < d["open"]
+
+        d["range"] = (
+            d["high"] -
+            d["low"]
         )
 
-        data["bear"] = (
-            data["close"] < data["open"]
-        )
-
-        data["bullish"] = data["bull"]
-        data["bearish"] = data["bear"]
-
-        data["range"] = (
-            data["high"] -
-            data["low"]
-        )
-
-        data["body"] = (
-            data["close"] -
-            data["open"]
+        d["body"] = (
+            d["close"] -
+            d["open"]
         ).abs()
 
-        data["body_ratio"] = np.where(
-            data["range"] > 0,
-            data["body"] / data["range"],
-            0
+        d["body_ratio"] = np.where(
+            d["range"] > 0,
+            d["body"] / d["range"],
+            0.0
         )
 
-        return data
+        return d
+
 
     # ============================================================
-    # SWINGS
+    # SWING DETECTION
     # ============================================================
 
     def detect_swings(self):
 
-        df = self.df
+        d = self.df
 
         highs = []
         lows = []
 
-        left = SWING_LEFT
-        right = SWING_RIGHT
+        if len(d) <= (
+            SWING_LEFT +
+            SWING_RIGHT
+        ):
+            return self
 
         for i in range(
-            left,
-            len(df) - right
+            SWING_LEFT,
+            len(d) - SWING_RIGHT
         ):
 
-            current_high = float(
-                df.iloc[i]["high"]
+            high = float(
+                d.iloc[i]["high"]
             )
 
-            current_low = float(
-                df.iloc[i]["low"]
+            low = float(
+                d.iloc[i]["low"]
             )
 
             left_high = float(
-                df.iloc[
-                    i - left:i
+                d.iloc[
+                    i - SWING_LEFT:i
                 ]["high"].max()
             )
 
             right_high = float(
-                df.iloc[
-                    i + 1:i + right + 1
+                d.iloc[
+                    i + 1:i + SWING_RIGHT + 1
                 ]["high"].max()
             )
 
             left_low = float(
-                df.iloc[
-                    i - left:i
+                d.iloc[
+                    i - SWING_LEFT:i
                 ]["low"].min()
             )
 
             right_low = float(
-                df.iloc[
-                    i + 1:i + right + 1
+                d.iloc[
+                    i + 1:i + SWING_RIGHT + 1
                 ]["low"].min()
             )
 
-            confirmed_idx = i + right
+            # Confirmation happens only after RIGHT candles.
+            confirmation_idx = (
+                i + SWING_RIGHT
+            )
+
+            confirmation_time = (
+                d.iloc[
+                    confirmation_idx
+                ]["time"]
+            )
 
             if (
-                current_high >= left_high
+                high >= left_high
                 and
-                current_high >= right_high
+                high >= right_high
             ):
 
                 highs.append(
                     SwingPoint(
-                        idx=confirmed_idx,
-                        time=df.iloc[
-                            confirmed_idx
-                        ]["time"],
-                        price=current_high,
-                        kind="HIGH"
+                        confirmation_idx,
+                        confirmation_time,
+                        high,
+                        "HIGH"
                     )
                 )
 
             if (
-                current_low <= left_low
+                low <= left_low
                 and
-                current_low <= right_low
+                low <= right_low
             ):
 
                 lows.append(
                     SwingPoint(
-                        idx=confirmed_idx,
-                        time=df.iloc[
-                            confirmed_idx
-                        ]["time"],
-                        price=current_low,
-                        kind="LOW"
+                        confirmation_idx,
+                        confirmation_time,
+                        low,
+                        "LOW"
                     )
                 )
 
@@ -394,318 +363,307 @@ class SMCEngine:
 
         return self
 
+
     # ============================================================
-    # LABEL SWINGS
+    # SWING LABELING
     # ============================================================
 
     def label_swings(self):
 
-        previous_high = None
-        previous_low = None
+        previous = None
 
         for swing in self.swings_high:
 
-            if previous_high is None:
-
+            if previous is None:
                 swing.label = "H"
 
-            elif swing.price > previous_high:
-
+            elif swing.price > previous:
                 swing.label = "HH"
 
             else:
-
                 swing.label = "LH"
 
-            previous_high = swing.price
+            previous = swing.price
+
+        previous = None
 
         for swing in self.swings_low:
 
-            if previous_low is None:
-
+            if previous is None:
                 swing.label = "L"
 
-            elif swing.price > previous_low:
-
+            elif swing.price > previous:
                 swing.label = "HL"
 
             else:
-
                 swing.label = "LL"
 
-            previous_low = swing.price
+            previous = swing.price
 
         return self
 
+
     # ============================================================
-    # STRUCTURE ENGINE
+    # STRUCTURE
     # ============================================================
 
     def process_structure(self):
+
+        highs = {
+            swing.idx: swing
+            for swing in self.swings_high
+        }
+
+        lows = {
+            swing.idx: swing
+            for swing in self.swings_low
+        }
 
         events = []
 
         bias = "NEUTRAL"
 
-        active_high = None
-        active_low = None
+        external_high = None
+        external_low = None
 
-        consumed_high = set()
-        consumed_low = set()
+        protected_high = None
+        protected_low = None
 
-        high_map = {
-            x.idx: x
-            for x in self.swings_high
-        }
+        broken_high = set()
+        broken_low = set()
 
-        low_map = {
-            x.idx: x
-            for x in self.swings_low
-        }
-
-        for i in range(
-            len(self.df)
-        ):
+        for i in range(len(self.df)):
 
             row = self.df.iloc[i]
 
-            close = float(
-                row["close"]
-            )
+            close = float(row["close"])
 
-            time = row["time"]
+            if i in highs:
+                external_high = highs[i]
 
-            if i in high_map:
-
-                active_high = high_map[i]
-
-            if i in low_map:
-
-                active_low = low_map[i]
+            if i in lows:
+                external_low = lows[i]
 
             # ----------------------------------------------------
-            # INITIAL BIAS
+            # INITIAL STRUCTURE
             # ----------------------------------------------------
 
             if bias == "NEUTRAL":
 
                 if (
-                    active_high is not None
+                    external_high
                     and
-                    close > active_high.price
+                    close > external_high.price
                     and
-                    active_high.idx
-                    not in consumed_high
+                    external_high.idx not in broken_high
                 ):
 
                     events.append(
                         StructureEvent(
-                            idx=i,
-                            time=time,
-                            event="INITIAL_BOS_UP",
-                            direction="BUY",
-                            price=close,
-                            reference="external_high"
+                            i,
+                            row["time"],
+                            "INITIAL_BOS_UP",
+                            "BUY",
+                            close,
+                            "external_high"
                         )
                     )
 
-                    consumed_high.add(
-                        active_high.idx
+                    broken_high.add(
+                        external_high.idx
                     )
 
                     bias = "BULL"
 
-                    if active_low is not None:
-
-                        self.protected_low = (
-                            active_low
-                        )
+                    protected_low = (
+                        external_low
+                    )
 
                     continue
 
                 if (
-                    active_low is not None
+                    external_low
                     and
-                    close < active_low.price
+                    close < external_low.price
                     and
-                    active_low.idx
-                    not in consumed_low
+                    external_low.idx not in broken_low
                 ):
 
                     events.append(
                         StructureEvent(
-                            idx=i,
-                            time=time,
-                            event="INITIAL_BOS_DOWN",
-                            direction="SELL",
-                            price=close,
-                            reference="external_low"
+                            i,
+                            row["time"],
+                            "INITIAL_BOS_DOWN",
+                            "SELL",
+                            close,
+                            "external_low"
                         )
                     )
 
-                    consumed_low.add(
-                        active_low.idx
+                    broken_low.add(
+                        external_low.idx
                     )
 
                     bias = "BEAR"
 
-                    if active_high is not None:
-
-                        self.protected_high = (
-                            active_high
-                        )
+                    protected_high = (
+                        external_high
+                    )
 
                     continue
 
+
             # ----------------------------------------------------
-            # BULL
+            # BULL STRUCTURE
             # ----------------------------------------------------
 
             elif bias == "BULL":
 
                 if (
-                    active_high is not None
+                    external_high
                     and
-                    close > active_high.price
+                    close > external_high.price
                     and
-                    active_high.idx
-                    not in consumed_high
+                    external_high.idx not in broken_high
                 ):
 
                     events.append(
                         StructureEvent(
-                            idx=i,
-                            time=time,
-                            event="BOS_UP",
-                            direction="BUY",
-                            price=close,
-                            reference="external_high"
+                            i,
+                            row["time"],
+                            "BOS_UP",
+                            "BUY",
+                            close,
+                            "external_high"
                         )
                     )
 
-                    consumed_high.add(
-                        active_high.idx
+                    broken_high.add(
+                        external_high.idx
                     )
 
-                    if active_low is not None:
-
-                        self.protected_low = (
-                            active_low
+                    if external_low:
+                        protected_low = (
+                            external_low
                         )
 
                     continue
 
                 if (
-                    self.protected_low is not None
+                    protected_low
                     and
-                    close < self.protected_low.price
+                    close < protected_low.price
                     and
-                    self.protected_low.idx
-                    not in consumed_low
+                    protected_low.idx not in broken_low
                 ):
 
                     events.append(
                         StructureEvent(
-                            idx=i,
-                            time=time,
-                            event="CHoCH_DOWN",
-                            direction="SELL",
-                            price=close,
-                            reference="protected_low"
+                            i,
+                            row["time"],
+                            "CHoCH_DOWN",
+                            "SELL",
+                            close,
+                            "protected_low"
                         )
                     )
 
-                    consumed_low.add(
-                        self.protected_low.idx
+                    broken_low.add(
+                        protected_low.idx
                     )
 
                     bias = "BEAR"
 
-                    if active_high is not None:
-
-                        self.protected_high = (
-                            active_high
-                        )
+                    protected_high = (
+                        external_high
+                    )
 
                     continue
 
+
             # ----------------------------------------------------
-            # BEAR
+            # BEAR STRUCTURE
             # ----------------------------------------------------
 
-            elif bias == "BEAR":
+            else:
 
                 if (
-                    active_low is not None
+                    external_low
                     and
-                    close < active_low.price
+                    close < external_low.price
                     and
-                    active_low.idx
-                    not in consumed_low
+                    external_low.idx not in broken_low
                 ):
 
                     events.append(
                         StructureEvent(
-                            idx=i,
-                            time=time,
-                            event="BOS_DOWN",
-                            direction="SELL",
-                            price=close,
-                            reference="external_low"
+                            i,
+                            row["time"],
+                            "BOS_DOWN",
+                            "SELL",
+                            close,
+                            "external_low"
                         )
                     )
 
-                    consumed_low.add(
-                        active_low.idx
+                    broken_low.add(
+                        external_low.idx
                     )
 
-                    if active_high is not None:
-
-                        self.protected_high = (
-                            active_high
+                    if external_high:
+                        protected_high = (
+                            external_high
                         )
 
                     continue
 
                 if (
-                    self.protected_high is not None
+                    protected_high
                     and
-                    close > self.protected_high.price
+                    close > protected_high.price
                     and
-                    self.protected_high.idx
-                    not in consumed_high
+                    protected_high.idx not in broken_high
                 ):
 
                     events.append(
                         StructureEvent(
-                            idx=i,
-                            time=time,
-                            event="CHoCH_UP",
-                            direction="BUY",
-                            price=close,
-                            reference="protected_high"
+                            i,
+                            row["time"],
+                            "CHoCH_UP",
+                            "BUY",
+                            close,
+                            "protected_high"
                         )
                     )
 
-                    consumed_high.add(
-                        self.protected_high.idx
+                    broken_high.add(
+                        protected_high.idx
                     )
 
                     bias = "BULL"
 
-                    if active_low is not None:
-
-                        self.protected_low = (
-                            active_low
-                        )
+                    protected_low = (
+                        external_low
+                    )
 
                     continue
 
         self.structure = events
+
         self.events.extend(events)
+
         self.bias = bias
 
+        self.protected_high = (
+            protected_high
+        )
+
+        self.protected_low = (
+            protected_low
+        )
+
         return self
+
 
     # ============================================================
     # LIQUIDITY POOLS
@@ -715,146 +673,71 @@ class SMCEngine:
 
         pools = []
 
-        # --------------------------------------------------------
-        # HIGH POOLS
-        # --------------------------------------------------------
+        # Highs = BUY SIDE LIQUIDITY
+        # Lows  = SELL SIDE LIQUIDITY
 
-        highs = list(
-            self.swings_high
-        )
-
-        used = set()
-
-        for i, swing in enumerate(
-            highs
+        for direction, swings in (
+            ("SELL", self.swings_high),
+            ("BUY", self.swings_low)
         ):
 
-            if i in used:
-                continue
+            used = set()
 
-            cluster = [
-                swing
-            ]
+            for i, swing in enumerate(swings):
 
-            for j in range(
-                i + 1,
-                len(highs)
-            ):
-
-                if j in used:
+                if i in used:
                     continue
 
-                other = highs[j]
+                cluster = [swing]
 
-                if abs(
-                    other.price -
-                    swing.price
-                ) <= LIQUIDITY_TOLERANCE:
+                for j in range(
+                    i + 1,
+                    len(swings)
+                ):
 
-                    cluster.append(
-                        other
+                    if j in used:
+                        continue
+
+                    if (
+                        abs(
+                            swings[j].price -
+                            swing.price
+                        )
+                        <=
+                        LIQUIDITY_TOLERANCE
+                    ):
+
+                        cluster.append(
+                            swings[j]
+                        )
+
+                        used.add(j)
+
+                average_price = float(
+                    np.mean([
+                        item.price
+                        for item in cluster
+                    ])
+                )
+
+                pools.append(
+                    LiquidityPool(
+                        0,
+                        direction,
+                        average_price,
+                        min(
+                            item.idx
+                            for item in cluster
+                        ),
+                        max(
+                            item.idx
+                            for item in cluster
+                        ),
+                        len(cluster)
                     )
-
-                    used.add(j)
-
-            representative = float(
-                np.mean(
-                    [
-                        x.price
-                        for x in cluster
-                    ]
                 )
-            )
 
-            pools.append(
-                LiquidityPool(
-                    pool_id=0,
-                    direction="SELL",
-                    price=representative,
-                    start_idx=min(
-                        x.idx
-                        for x in cluster
-                    ),
-                    last_idx=max(
-                        x.idx
-                        for x in cluster
-                    ),
-                    touches=len(cluster)
-                )
-            )
-
-        # --------------------------------------------------------
-        # LOW POOLS
-        # --------------------------------------------------------
-
-        lows = list(
-            self.swings_low
-        )
-
-        used = set()
-
-        for i, swing in enumerate(
-            lows
-        ):
-
-            if i in used:
-                continue
-
-            cluster = [
-                swing
-            ]
-
-            for j in range(
-                i + 1,
-                len(lows)
-            ):
-
-                if j in used:
-                    continue
-
-                other = lows[j]
-
-                if abs(
-                    other.price -
-                    swing.price
-                ) <= LIQUIDITY_TOLERANCE:
-
-                    cluster.append(
-                        other
-                    )
-
-                    used.add(j)
-
-            representative = float(
-                np.mean(
-                    [
-                        x.price
-                        for x in cluster
-                    ]
-                )
-            )
-
-            pools.append(
-                LiquidityPool(
-                    pool_id=0,
-                    direction="BUY",
-                    price=representative,
-                    start_idx=min(
-                        x.idx
-                        for x in cluster
-                    ),
-                    last_idx=max(
-                        x.idx
-                        for x in cluster
-                    ),
-                    touches=len(cluster)
-                )
-            )
-
-        # --------------------------------------------------------
-        # FINAL DEDUPLICATION
-        # --------------------------------------------------------
-
+        # Remove duplicate price regions.
         cleaned = []
 
         for pool in sorted(
@@ -876,28 +759,28 @@ class SMCEngine:
                     abs(
                         existing.price -
                         pool.price
-                    ) <= LIQUIDITY_TOLERANCE
+                    )
+                    <=
+                    LIQUIDITY_TOLERANCE
                 ):
 
                     duplicate = True
                     break
 
             if not duplicate:
+                cleaned.append(pool)
 
-                cleaned.append(
-                    pool
-                )
-
-        for i, pool in enumerate(
+        for number, pool in enumerate(
             cleaned,
             start=1
         ):
 
-            pool.pool_id = i
+            pool.pool_id = number
 
         self.liquidity = cleaned
 
         return self
+
 
     # ============================================================
     # DISPLACEMENT
@@ -905,155 +788,140 @@ class SMCEngine:
 
     def is_displacement(
         self,
-        idx: int,
-        direction: str
+        idx,
+        direction
     ):
 
         if idx < DISPLACEMENT_LOOKBACK:
-
             return False
 
-        row = self.df.iloc[
-            idx
-        ]
-
-        candle_range = safe_float(
-            row["range"]
-        )
-
-        if candle_range <= 0:
-
+        if idx >= len(self.df):
             return False
 
-        body_ratio = safe_float(
-            row["body_ratio"]
-        )
-
-        previous = self.df.iloc[
-            idx -
-            DISPLACEMENT_LOOKBACK:idx
-        ]["range"]
+        row = self.df.iloc[idx]
 
         average_range = safe_float(
-            previous.mean()
+            self.df.iloc[
+                idx - DISPLACEMENT_LOOKBACK:idx
+            ]["range"].mean()
         )
 
         if average_range <= 0:
-
             return False
 
-        large_range = (
-            candle_range
-            >=
-            average_range
-            *
-            DISPLACEMENT_RANGE_MULTIPLIER
+        current_range = safe_float(
+            row["range"]
         )
 
+        if current_range <= 0:
+            return False
+
         strong_body = (
-            body_ratio
+            safe_float(
+                row["body_ratio"]
+            )
             >=
             DISPLACEMENT_BODY_RATIO
         )
 
-        if direction == "BUY":
+        large_range = (
+            current_range
+            >=
+            average_range *
+            DISPLACEMENT_RANGE_MULTIPLIER
+        )
 
-            return (
-                bool(row["bull"])
-                and
-                large_range
-                and
-                strong_body
-            )
+        directional = (
+            direction == "BUY"
+            and
+            bool(row["bull"])
+        ) or (
+            direction == "SELL"
+            and
+            bool(row["bear"])
+        )
 
-        if direction == "SELL":
+        return bool(
+            strong_body
+            and
+            large_range
+            and
+            directional
+        )
 
-            return (
-                bool(row["bear"])
-                and
-                large_range
-                and
-                strong_body
-            )
-
-        return False
 
     # ============================================================
-    # FVG
+    # FAIR VALUE GAP
     # ============================================================
 
     def detect_fvg(self):
 
-        df = self.df
+        d = self.df
 
         for i in range(
             2,
-            len(df)
+            len(d)
         ):
 
-            a = df.iloc[
-                i - 2
-            ]
+            first = d.iloc[i - 2]
+            third = d.iloc[i]
 
-            c = df.iloc[
-                i
-            ]
-
-            # Bullish
+            # Bullish FVG
             if (
-                c["low"] > a["high"]
+                third["low"]
+                >
+                first["high"]
                 and
                 (
-                    c["low"] -
-                    a["high"]
-                ) >= MIN_FVG_SIZE
+                    third["low"] -
+                    first["high"]
+                )
+                >=
+                MIN_FVG_SIZE
             ):
 
                 self.fvg_zones.append(
                     Zone(
-                        zone_id=0,
-                        zone_type="FVG",
-                        direction="BUY",
-                        high=float(
-                            c["low"]
-                        ),
-                        low=float(
-                            a["high"]
-                        ),
-                        created_idx=i,
-                        created_time=c["time"],
-                        source_idx=i - 1
+                        0,
+                        "FVG",
+                        "BUY",
+                        float(third["low"]),
+                        float(first["high"]),
+                        i,
+                        third["time"],
+                        i - 1
                     )
                 )
 
-            # Bearish
-            if (
-                c["high"] < a["low"]
+            # Bearish FVG
+            elif (
+                third["high"]
+                <
+                first["low"]
                 and
                 (
-                    a["low"] -
-                    c["high"]
-                ) >= MIN_FVG_SIZE
+                    first["low"] -
+                    third["high"]
+                )
+                >=
+                MIN_FVG_SIZE
             ):
 
                 self.fvg_zones.append(
                     Zone(
-                        zone_id=0,
-                        zone_type="FVG",
-                        direction="SELL",
-                        high=float(
-                            a["low"]
-                        ),
-                        low=float(
-                            c["high"]
-                        ),
-                        created_idx=i,
-                        created_time=c["time"],
-                        source_idx=i - 1
+                        0,
+                        "FVG",
+                        "SELL",
+                        float(first["low"]),
+                        float(third["high"]),
+                        i,
+                        third["time"],
+                        i - 1
                     )
                 )
 
         return self
+
 
     # ============================================================
     # ORDER BLOCK
@@ -1061,105 +929,102 @@ class SMCEngine:
 
     def detect_order_blocks(self):
 
-        df = self.df
+        d = self.df
 
         for i in range(
             1,
-            len(df)
+            len(d)
         ):
 
-            is_buy_displacement = (
-                self.is_displacement(
-                    i,
-                    "BUY"
-                )
-            )
-
-            is_sell_displacement = (
-                self.is_displacement(
-                    i,
-                    "SELL"
-                )
-            )
-
-            if (
-                not is_buy_displacement
-                and
-                not is_sell_displacement
+            if self.is_displacement(
+                i,
+                "BUY"
             ):
+
+                direction = "BUY"
+
+            elif self.is_displacement(
+                i,
+                "SELL"
+            ):
+
+                direction = "SELL"
+
+            else:
 
                 continue
 
-            direction = (
-                "BUY"
-                if is_buy_displacement
-                else
-                "SELL"
-            )
-
-            start = max(
-                0,
-                i - OB_LOOKBACK
-            )
-
-            opposite_idx = None
+            source = None
 
             for j in range(
                 i - 1,
-                start - 1,
+                max(
+                    -1,
+                    i - OB_LOOKBACK - 1
+                ),
                 -1
             ):
-
-                row = df.iloc[
-                    j
-                ]
 
                 if (
                     direction == "BUY"
                     and
-                    row["bear"]
+                    bool(d.iloc[j]["bear"])
                 ):
 
-                    opposite_idx = j
+                    source = j
                     break
 
                 if (
                     direction == "SELL"
                     and
-                    row["bull"]
+                    bool(d.iloc[j]["bull"])
                 ):
 
-                    opposite_idx = j
+                    source = j
                     break
 
-            if opposite_idx is None:
-
+            if source is None:
                 continue
 
-            row = df.iloc[
-                opposite_idx
-            ]
+            source_row = d.iloc[source]
+            displacement_row = d.iloc[i]
+
+            if direction == "SELL":
+
+                gap = max(
+                    0.0,
+                    float(source_row["low"])
+                    -
+                    float(displacement_row["high"])
+                )
+
+            else:
+
+                gap = max(
+                    0.0,
+                    float(displacement_row["low"])
+                    -
+                    float(source_row["high"])
+                )
+
+            if gap > MAX_POI_DISPLACEMENT_GAP:
+                continue
 
             self.ob_zones.append(
                 Zone(
-                    zone_id=0,
-                    zone_type="OB",
-                    direction=direction,
-                    high=float(
-                        row["high"]
-                    ),
-                    low=float(
-                        row["low"]
-                    ),
-                    created_idx=i,
-                    created_time=df.iloc[
-                        i
-                    ]["time"],
-                    source_idx=opposite_idx
+                    0,
+                    "OB",
+                    direction,
+                    float(source_row["high"]),
+                    float(source_row["low"]),
+                    i,
+                    displacement_row["time"],
+                    source
                 )
             )
 
         return self
+
 
     # ============================================================
     # BUILD ZONES
@@ -1168,46 +1033,40 @@ class SMCEngine:
     def build_zones(self):
 
         self.detect_fvg()
+
         self.detect_order_blocks()
 
-        self.zones = []
-
-        for zone in (
-            self.fvg_zones
-            +
+        self.zones = (
+            self.fvg_zones +
             self.ob_zones
+        )
+
+        for number, zone in enumerate(
+            self.zones,
+            start=1
         ):
 
-            zone.zone_id = (
-                len(self.zones)
-                +
-                1
-            )
-
-            self.zones.append(
-                zone
-            )
+            zone.zone_id = number
 
         return self
 
+
     # ============================================================
-    # UPDATE ZONE STATE
+    # ZONE STATES
     # ============================================================
 
     def update_zone_states(self):
 
-        df = self.df
+        d = self.df
 
         for zone in self.zones:
 
             for i in range(
                 zone.created_idx + 1,
-                len(df)
+                len(d)
             ):
 
-                row = df.iloc[
-                    i
-                ]
+                row = d.iloc[i]
 
                 high = float(
                     row["high"]
@@ -1221,57 +1080,53 @@ class SMCEngine:
                     row["close"]
                 )
 
-                # ------------------------------------------------
-                # INVALIDATION
-                # ------------------------------------------------
+                # BUY POI invalidation
+                if (
+                    zone.direction == "BUY"
+                    and
+                    close < zone.low
+                ):
 
-                if zone.direction == "BUY":
+                    zone.state = (
+                        "INVALIDATED"
+                    )
 
-                    if close < zone.low:
+                    zone.invalidated_idx = i
 
-                        zone.state = (
-                            "INVALIDATED"
-                        )
+                    break
 
-                        zone.invalidated_idx = i
+                # SELL POI invalidation
+                if (
+                    zone.direction == "SELL"
+                    and
+                    close > zone.high
+                ):
 
-                        break
+                    zone.state = (
+                        "INVALIDATED"
+                    )
 
-                else:
+                    zone.invalidated_idx = i
 
-                    if close > zone.high:
+                    break
 
-                        zone.state = (
-                            "INVALIDATED"
-                        )
-
-                        zone.invalidated_idx = i
-
-                        break
-
-                # ------------------------------------------------
-                # FIRST MITIGATION
-                # ------------------------------------------------
-
-                touched = (
+                # First mitigation
+                if (
                     high >= zone.low
                     and
                     low <= zone.high
-                )
-
-                if (
-                    touched
                     and
                     zone.state == "ACTIVE"
                 ):
 
-                    zone.state = (
-                        "MITIGATED"
-                    )
+                    zone.state = "MITIGATED"
 
                     zone.mitigated_idx = i
 
+                    # Mitigation does not mean invalidation.
+
         return self
+
 
     # ============================================================
     # LIQUIDITY SWEEPS
@@ -1279,18 +1134,11 @@ class SMCEngine:
 
     def detect_liquidity_sweeps(self):
 
-        df = self.df
+        d = self.df
 
-        # Sort pools by time.
-        pools = sorted(
-            self.liquidity,
-            key=lambda x: x.last_idx
-        )
-
-        for pool in pools:
+        for pool in self.liquidity:
 
             if pool.consumed:
-
                 continue
 
             start = max(
@@ -1300,12 +1148,10 @@ class SMCEngine:
 
             for i in range(
                 start,
-                len(df)
+                len(d)
             ):
 
-                row = df.iloc[
-                    i
-                ]
+                row = d.iloc[i]
 
                 high = float(
                     row["high"]
@@ -1319,72 +1165,55 @@ class SMCEngine:
                     row["close"]
                 )
 
-                # ------------------------------------------------
-                # SELL-SIDE LIQUIDITY
-                # ------------------------------------------------
-
+                # High liquidity sweep
                 if pool.direction == "SELL":
 
-                    if (
+                    swept = (
                         high > pool.price
                         and
                         close < pool.price
-                    ):
+                    )
 
-                        self.events.append(
-                            StructureEvent(
-                                idx=i,
-                                time=row["time"],
-                                event="LIQUIDITY_SWEEP_HIGH",
-                                direction="SELL",
-                                price=pool.price,
-                                reference=(
-                                    f"pool_{pool.pool_id}"
-                                )
-                            )
-                        )
+                    event_name = (
+                        "LIQUIDITY_SWEEP_HIGH"
+                    )
 
-                        pool.consumed = True
+                # Low liquidity sweep
+                else:
 
-                        break
-
-                # ------------------------------------------------
-                # BUY-SIDE LIQUIDITY
-                # ------------------------------------------------
-
-                if pool.direction == "BUY":
-
-                    if (
+                    swept = (
                         low < pool.price
                         and
                         close > pool.price
-                    ):
+                    )
 
-                        self.events.append(
-                            StructureEvent(
-                                idx=i,
-                                time=row["time"],
-                                event="LIQUIDITY_SWEEP_LOW",
-                                direction="BUY",
-                                price=pool.price,
-                                reference=(
-                                    f"pool_{pool.pool_id}"
-                                )
-                            )
-                        )
+                    event_name = (
+                        "LIQUIDITY_SWEEP_LOW"
+                    )
 
-                        pool.consumed = True
+                if not swept:
+                    continue
 
-                        break
+                self.events.append(
+                    StructureEvent(
+                        i,
+                        row["time"],
+                        event_name,
+                        pool.direction,
+                        pool.price,
+                        f"pool_{pool.pool_id}"
+                    )
+                )
 
-        self.events.sort(
-            key=lambda x: x.idx
-        )
+                pool.consumed = True
+
+                break
 
         return self
 
+
     # ============================================================
-    # RUN
+    # ENGINE RUN
     # ============================================================
 
     def run(self):
@@ -1404,89 +1233,92 @@ class SMCEngine:
         self.update_zone_states()
 
         self.events.sort(
-            key=lambda x: x.idx
+            key=lambda event: event.idx
         )
 
         return self
 
+
     # ============================================================
-    # STATS
+    # STATISTICS
     # ============================================================
 
     def stats(self):
 
         return {
-            "candles": len(
-                self.df
-            ),
 
-            "swing_high": len(
-                self.swings_high
-            ),
+            "swing_high":
+                len(self.swings_high),
 
-            "swing_low": len(
-                self.swings_low
-            ),
+            "swing_low":
+                len(self.swings_low),
 
-            "bos_up": len([
-                e for e in self.structure
-                if e.event == "BOS_UP"
-            ]),
+            "bos_up":
+                sum(
+                    e.event == "BOS_UP"
+                    for e in self.structure
+                ),
 
-            "bos_down": len([
-                e for e in self.structure
-                if e.event == "BOS_DOWN"
-            ]),
+            "bos_down":
+                sum(
+                    e.event == "BOS_DOWN"
+                    for e in self.structure
+                ),
 
-            "choch_up": len([
-                e for e in self.structure
-                if e.event == "CHoCH_UP"
-            ]),
+            "choch_up":
+                sum(
+                    e.event == "CHoCH_UP"
+                    for e in self.structure
+                ),
 
-            "choch_down": len([
-                e for e in self.structure
-                if e.event == "CHoCH_DOWN"
-            ]),
+            "choch_down":
+                sum(
+                    e.event == "CHoCH_DOWN"
+                    for e in self.structure
+                ),
 
-            "sweep_high": len([
-                e for e in self.events
-                if e.event ==
-                "LIQUIDITY_SWEEP_HIGH"
-            ]),
+            "sweep_high":
+                sum(
+                    e.event ==
+                    "LIQUIDITY_SWEEP_HIGH"
+                    for e in self.events
+                ),
 
-            "sweep_low": len([
-                e for e in self.events
-                if e.event ==
-                "LIQUIDITY_SWEEP_LOW"
-            ]),
+            "sweep_low":
+                sum(
+                    e.event ==
+                    "LIQUIDITY_SWEEP_LOW"
+                    for e in self.events
+                ),
 
-            "fvg": len(
-                self.fvg_zones
-            ),
+            "fvg":
+                len(self.fvg_zones),
 
-            "ob": len(
-                self.ob_zones
-            ),
+            "ob":
+                len(self.ob_zones),
 
-            "active_zones": len([
-                z for z in self.zones
-                if z.state == "ACTIVE"
-            ]),
+            "active_zones":
+                sum(
+                    z.state == "ACTIVE"
+                    for z in self.zones
+                ),
 
-            "mitigated_zones": len([
-                z for z in self.zones
-                if z.state == "MITIGATED"
-            ]),
+            "mitigated_zones":
+                sum(
+                    z.state == "MITIGATED"
+                    for z in self.zones
+                ),
 
-            "invalidated_zones": len([
-                z for z in self.zones
-                if z.state == "INVALIDATED"
-            ])
+            "invalidated_zones":
+                sum(
+                    z.state == "INVALIDATED"
+                    for z in self.zones
+                )
         }
 
 
 # ================================================================
-# SETUP ENGINE
+# SMC SETUP ENGINE
 # ================================================================
 
 class SMCSetupEngine:
@@ -1504,34 +1336,41 @@ class SMCSetupEngine:
         self.m15 = m15
         self.m5 = m5
 
+
     # ============================================================
-    # M15 SWEEP
+    # M15 SWEEPS
     # ============================================================
 
-    def get_sweeps(
-        self,
-        direction
-    ):
+    def sweeps(self, direction):
 
         if direction == "BUY":
 
-            return [
-                e for e in self.m15.events
-                if e.event ==
+            event_name = (
                 "LIQUIDITY_SWEEP_LOW"
-            ]
+            )
 
-        return [
-            e for e in self.m15.events
-            if e.event ==
-            "LIQUIDITY_SWEEP_HIGH"
-        ]
+        else:
+
+            event_name = (
+                "LIQUIDITY_SWEEP_HIGH"
+            )
+
+        return sorted(
+            [
+                e
+                for e in self.m15.events
+                if e.event == event_name
+            ],
+            key=lambda x: x.idx,
+            reverse=True
+        )
+
 
     # ============================================================
-    # STRUCTURE AFTER SWEEP
+    # M15 STRUCTURE AFTER SWEEP
     # ============================================================
 
-    def find_structure_after(
+    def structure_after(
         self,
         sweep,
         direction
@@ -1539,13 +1378,13 @@ class SMCSetupEngine:
 
         if direction == "BUY":
 
-            valid = (
+            valid_events = (
                 "CHoCH_UP",
                 "BOS_UP",
                 "INITIAL_BOS_UP"
             )
 
-            opposite = (
+            opposite_events = (
                 "CHoCH_DOWN",
                 "BOS_DOWN",
                 "INITIAL_BOS_DOWN"
@@ -1553,83 +1392,76 @@ class SMCSetupEngine:
 
         else:
 
-            valid = (
+            valid_events = (
                 "CHoCH_DOWN",
                 "BOS_DOWN",
                 "INITIAL_BOS_DOWN"
             )
 
-            opposite = (
+            opposite_events = (
                 "CHoCH_UP",
                 "BOS_UP",
                 "INITIAL_BOS_UP"
             )
 
-        end = (
-            sweep.idx
-            +
+        end_idx = (
+            sweep.idx +
             MAX_STRUCTURE_AFTER_SWEEP
         )
 
         candidates = [
-            e for e in self.m15.structure
+            event
+            for event in self.m15.structure
             if (
-                e.event in valid
+                event.event in valid_events
                 and
-                e.idx >= sweep.idx
-                and
-                e.idx <= end
+                sweep.idx < event.idx <= end_idx
             )
         ]
 
         if not candidates:
-
             return None
 
-        candidates.sort(
+        candidate = min(
+            candidates,
             key=lambda x: x.idx
         )
 
-        candidate = candidates[0]
+        # Opposing structure before confirmation
+        for event in self.m15.structure:
 
-        opposing = [
-            e for e in self.m15.structure
             if (
-                e.event in opposite
+                event.event in opposite_events
                 and
-                e.idx >= sweep.idx
+                sweep.idx < event.idx
+                < candidate.idx
                 and
-                e.idx < candidate.idx
-                and
-                e.idx <= end
-            )
-        ]
+                event.idx <= end_idx
+            ):
 
-        if opposing:
-
-            return None
+                return None
 
         return candidate
 
+
     # ============================================================
-    # DISPLACEMENT
+    # M15 DISPLACEMENT
     # ============================================================
 
-    def find_displacement_after(
+    def displacement_after(
         self,
         structure,
         direction
     ):
 
-        start = structure.idx
+        start = (
+            structure.idx + 1
+        )
 
         end = min(
             len(self.m15.df),
-            start
-            +
+            start +
             MAX_DISPLACEMENT_AFTER_STRUCTURE
-            +
-            1
         )
 
         for i in range(
@@ -1646,55 +1478,15 @@ class SMCSetupEngine:
 
         return None
 
+
     # ============================================================
-    # POI
+    # ZONE / CANDLE INTERSECTION
     # ============================================================
 
-    def find_poi(
+    def zone_intersects_candle(
         self,
-        displacement_idx,
-        direction
-    ):
-
-        candidates = [
-            z for z in self.m15.zones
-            if (
-                z.direction == direction
-                and
-                z.state == "ACTIVE"
-                and
-                z.created_idx >= displacement_idx
-                and
-                z.created_idx <= (
-                    displacement_idx
-                    +
-                    MAX_POI_AFTER_DISPLACEMENT
-                )
-            )
-        ]
-
-        if not candidates:
-
-            return None
-
-        candidates.sort(
-            key=lambda z: (
-                z.created_idx,
-                0 if z.zone_type == "OB"
-                else 1
-            )
-        )
-
-        return candidates[0]
-
-    # ============================================================
-    # POI TOUCH
-    # ============================================================
-
-    def row_touches_zone(
-        self,
-        row,
-        zone
+        zone,
+        row
     ):
 
         high = float(
@@ -1705,103 +1497,366 @@ class SMCSetupEngine:
             row["low"]
         )
 
-        return (
-            high >= (
-                zone.low -
-                POI_TOUCH_TOLERANCE
+        overlap = (
+            min(
+                high,
+                zone.high
             )
-            and
-            low <= (
-                zone.high +
-                POI_TOUCH_TOLERANCE
+            -
+            max(
+                low,
+                zone.low
             )
         )
 
+        return (
+            overlap > MIN_ZONE_OVERLAP,
+            max(0.0, overlap)
+        )
+
+
     # ============================================================
-    # M5 SWEEP AFTER POI TOUCH
+    # ZONE DISTANCE TO CANDLE
     # ============================================================
 
-    def find_m5_sweep_after_touch(
+    def zone_distance_to_candle(
         self,
-        touch_idx,
+        zone,
+        row
+    ):
+
+        high = float(
+            row["high"]
+        )
+
+        low = float(
+            row["low"]
+        )
+
+        if high < zone.low:
+
+            return (
+                zone.low -
+                high
+            )
+
+        if low > zone.high:
+
+            return (
+                low -
+                zone.high
+            )
+
+        return 0.0
+
+
+    # ============================================================
+    # ZONE DISTANCE TO PRICE
+    # ============================================================
+
+    def zone_distance_to_price(
+        self,
+        zone,
+        price
+    ):
+
+        price = float(price)
+
+        if price < zone.low:
+
+            return (
+                zone.low -
+                price
+            )
+
+        if price > zone.high:
+
+            return (
+                price -
+                zone.high
+            )
+
+        return 0.0
+
+
+    # ============================================================
+    # POI GEOMETRY
+    # ============================================================
+
+    def poi_geometry_valid(
+        self,
+        zone,
+        displacement_idx,
         direction
     ):
 
-        df = self.m5.df
+        if zone is None:
+            return False
+
+        if zone.state != "ACTIVE":
+            return False
+
+        # POI cannot come from an event before
+        # the displacement.
+        if zone.created_idx < displacement_idx:
+            return False
+
+        if (
+            zone.created_idx
+            >
+            displacement_idx +
+            MAX_POI_AFTER_DISPLACEMENT
+        ):
+
+            return False
+
+        drow = self.m15.df.iloc[
+            displacement_idx
+        ]
+
+        distance = (
+            self.zone_distance_to_candle(
+                zone,
+                drow
+            )
+        )
+
+        if (
+            distance >
+            MAX_POI_DISPLACEMENT_GAP
+        ):
+
+            return False
+
+        # --------------------------------------------------------
+        # Directional relationship
+        # --------------------------------------------------------
+
+        close = float(
+            drow["close"]
+        )
+
+        if direction == "SELL":
+
+            # A bearish displacement should
+            # move away downward from its POI.
+            if close > zone.high:
+                return False
+
+        else:
+
+            # A bullish displacement should
+            # move away upward from its POI.
+            if close < zone.low:
+                return False
+
+        # --------------------------------------------------------
+        # Source candle
+        # --------------------------------------------------------
+
+        source_idx = int(
+            zone.source_idx
+        )
+
+        if (
+            source_idx < 0
+            or
+            source_idx >= len(self.m15.df)
+        ):
+
+            return False
+
+        if (
+            abs(
+                source_idx -
+                displacement_idx
+            )
+            >
+            OB_LOOKBACK + 2
+        ):
+
+            return False
+
+        return True
+
+
+    # ============================================================
+    # FIND VALID POI
+    # ============================================================
+
+    def find_poi(
+        self,
+        displacement_idx,
+        direction
+    ):
+
+        candidates = []
+
+        for zone in self.m15.zones:
+
+            if zone.direction != direction:
+                continue
+
+            if zone.state != "ACTIVE":
+                continue
+
+            if not self.poi_geometry_valid(
+                zone,
+                displacement_idx,
+                direction
+            ):
+
+                continue
+
+            distance = (
+                self.zone_distance_to_candle(
+                    zone,
+                    self.m15.df.iloc[
+                        displacement_idx
+                    ]
+                )
+            )
+
+            candidates.append(
+                (
+                    distance,
+                    -zone.created_idx,
+                    zone
+                )
+            )
+
+        if not candidates:
+            return None
+
+        candidates.sort(
+            key=lambda item: (
+                item[0],
+                item[1]
+            )
+        )
+
+        return candidates[0][2]
+
+
+    # ============================================================
+    # LOCAL M5 LIQUIDITY SWEEP
+    # ============================================================
+
+    def local_sweep_after_touch(
+        self,
+        touch_idx,
+        direction,
+        end_idx,
+        zone=None
+    ):
+
+        d = self.m5.df
+
+        start = (
+            touch_idx + 1
+        )
 
         end = min(
-            len(df),
-            touch_idx
-            +
-            M5_MAX_CONFIRM_BARS
+            len(d),
+            touch_idx +
+            M5_MAX_CONFIRM_BARS +
+            1,
+            end_idx + 1
         )
 
         for i in range(
-            touch_idx,
+            start,
             end
         ):
 
-            if i < 1:
-
-                continue
-
-            row = df.iloc[
-                i
-            ]
-
-            start = max(
+            lookback_start = max(
                 0,
-                i -
-                M5_LOCAL_LOOKBACK
+                i - M5_LOCAL_LOOKBACK
             )
 
-            previous = df.iloc[
-                start:i
-            ]
+            lookback_end = i
 
-            if len(previous) == 0:
+            if (
+                lookback_end
+                <=
+                lookback_start
+            ):
 
                 continue
 
-            if direction == "BUY":
+            row = d.iloc[i]
 
-                local_low = float(
-                    previous["low"].min()
+            previous_high = float(
+                d.iloc[
+                    lookback_start:
+                    lookback_end
+                ]["high"].max()
+            )
+
+            previous_low = float(
+                d.iloc[
+                    lookback_start:
+                    lookback_end
+                ]["low"].min()
+            )
+
+            high = float(
+                row["high"]
+            )
+
+            low = float(
+                row["low"]
+            )
+
+            close = float(
+                row["close"]
+            )
+
+            # Sweep must occur at POI.
+            if zone is not None:
+
+                touched, _ = (
+                    self.zone_intersects_candle(
+                        zone,
+                        row
+                    )
                 )
 
-                if (
-                    row["low"] <
-                    local_low
-                    and
-                    row["close"] >
-                    local_low
-                ):
+                if not touched:
+                    continue
 
+            # SELL = sweep buy-side liquidity
+            if direction == "SELL":
+
+                swept = (
+                    high > previous_high
+                    and
+                    close < previous_high
+                )
+
+                if swept:
                     return i
 
+            # BUY = sweep sell-side liquidity
             else:
 
-                local_high = float(
-                    previous["high"].max()
+                swept = (
+                    low < previous_low
+                    and
+                    close > previous_low
                 )
 
-                if (
-                    row["high"] >
-                    local_high
-                    and
-                    row["close"] <
-                    local_high
-                ):
-
+                if swept:
                     return i
 
         return None
 
+
     # ============================================================
-    # M5 STRUCTURE
+    # M5 STRUCTURE AFTER SWEEP
     # ============================================================
 
-    def find_m5_structure(
+    def m5_structure_after(
         self,
         sweep_idx,
         direction
@@ -1815,6 +1870,12 @@ class SMCSetupEngine:
                 "INITIAL_BOS_UP"
             )
 
+            opposite = (
+                "CHoCH_DOWN",
+                "BOS_DOWN",
+                "INITIAL_BOS_DOWN"
+            )
+
         else:
 
             names = (
@@ -1823,46 +1884,67 @@ class SMCSetupEngine:
                 "INITIAL_BOS_DOWN"
             )
 
+            opposite = (
+                "CHoCH_UP",
+                "BOS_UP",
+                "INITIAL_BOS_UP"
+            )
+
         end = min(
             len(self.m5.df),
-            sweep_idx
-            +
-            M5_MAX_CONFIRM_BARS
-            +
+            sweep_idx +
+            M5_MAX_CONFIRM_BARS +
             1
         )
 
         candidates = [
-            e for e in self.m5.structure
+            event
+            for event in self.m5.structure
             if (
-                e.event in names
+                event.event in names
                 and
-                e.idx >= sweep_idx
-                and
-                e.idx < end
+                sweep_idx < event.idx < end
             )
         ]
 
         if not candidates:
-
             return None
 
-        return min(
+        candidate = min(
             candidates,
             key=lambda x: x.idx
         )
 
+        # Reject if opposite structure appears first.
+        for event in self.m5.structure:
+
+            if (
+                event.event in opposite
+                and
+                sweep_idx < event.idx
+                < candidate.idx
+                and
+                event.idx < end
+            ):
+
+                return None
+
+        return candidate
+
+
     # ============================================================
-    # M5 DISPLACEMENT
+    # M5 DISPLACEMENT AFTER STRUCTURE
     # ============================================================
 
-    def find_m5_displacement(
+    def m5_displacement_after(
         self,
         structure,
         direction
     ):
 
-        start = structure.idx
+        start = (
+            structure.idx + 1
+        )
 
         end = min(
             len(self.m5.df),
@@ -1883,89 +1965,73 @@ class SMCSetupEngine:
 
         return None
 
+
     # ============================================================
     # M5 RETEST
     # ============================================================
 
-    def find_m5_retest(
+    def retest_after(
         self,
         displacement_idx,
-        direction,
-        zone
+        zone,
+        direction
     ):
 
-        df = self.m5.df
+        d = self.m5.df
 
-        displacement = df.iloc[
-            displacement_idx
-        ]
-
-        candle_high = float(
-            displacement["high"]
-        )
-
-        candle_low = float(
-            displacement["low"]
+        end = min(
+            len(d),
+            displacement_idx + 16
         )
 
         for i in range(
             displacement_idx + 1,
-            min(
-                len(df),
-                displacement_idx + 15
-            )
+            end
         ):
 
-            row = df.iloc[
-                i
-            ]
+            row = d.iloc[i]
 
-            # ----------------------------------------------------
-            # Retest must still be related to M15 POI.
-            # ----------------------------------------------------
+            touched, overlap = (
+                self.zone_intersects_candle(
+                    zone,
+                    row
+                )
+            )
 
-            if not self.row_touches_zone(
-                row,
-                zone
+            if not touched:
+                continue
+
+            if (
+                self.zone_distance_to_candle(
+                    zone,
+                    row
+                )
+                >
+                POI_TOUCH_TOLERANCE
             ):
 
                 continue
 
-            # ----------------------------------------------------
-            # Also touch displacement candle.
-            # ----------------------------------------------------
-
-            displacement_touch = (
-                float(row["high"])
-                >= candle_low
+            if (
+                direction == "BUY"
                 and
-                float(row["low"])
-                <= candle_high
-            )
-
-            if not displacement_touch:
+                not bool(row["bull"])
+            ):
 
                 continue
 
-            if direction == "BUY":
+            if (
+                direction == "SELL"
+                and
+                not bool(row["bear"])
+            ):
 
-                if (
-                    row["close"] >
-                    row["open"]
-                ):
+                continue
 
-                    return i
-
-            else:
-
-                if (
-                    row["close"] <
-                    row["open"]
-                ):
-
-                    return i
+            return i
 
         return None
+
 
     # ============================================================
     # M5 CONFIRMATION
@@ -1977,15 +2043,30 @@ class SMCSetupEngine:
         direction
     ):
 
-        df = self.m5.df
+        d = self.m5.df
+
+        # POI must still be fresh.
+        if (
+            zone is None
+            or
+            zone.state != "ACTIVE"
+        ):
+
+            return {
+                "state":
+                    "WAITING",
+
+                "reason":
+                    "POI_NOT_ACTIVE"
+            }
 
         # --------------------------------------------------------
-        # Find M5 candles after POI creation.
+        # PRICE RETURN TO POI
         # --------------------------------------------------------
 
         start_candidates = list(
-            df.index[
-                df["time"] >=
+            d.index[
+                d["time"] >
                 zone.created_time
             ]
         )
@@ -1993,86 +2074,147 @@ class SMCSetupEngine:
         if not start_candidates:
 
             return {
-                "state": "WAITING",
-                "reason": "NO_M5_AFTER_POI",
-                "touch": None,
-                "sweep": None,
-                "structure": None,
-                "displacement": None,
-                "retest": None
+                "state":
+                    "WAITING",
+
+                "reason":
+                    "NO_M5_AFTER_POI"
             }
 
-        start_idx = start_candidates[0]
+        start = start_candidates[0]
 
         end = min(
-            len(df),
-            start_idx
-            +
+            len(d),
+            start +
             M5_CONFIRM_LOOKBACK
         )
 
-        # --------------------------------------------------------
-        # IMPORTANT:
-        # M5 MUST actually enter M15 POI.
-        # --------------------------------------------------------
-
-        touch_idx = None
+        touch = None
+        touch_overlap = 0.0
 
         for i in range(
-            start_idx,
+            start,
             end
         ):
 
-            if self.row_touches_zone(
-                df.iloc[i],
-                zone
+            row = d.iloc[i]
+
+            touched, overlap = (
+                self.zone_intersects_candle(
+                    zone,
+                    row
+                )
+            )
+
+            if not touched:
+                continue
+
+            high = float(
+                row["high"]
+            )
+
+            low = float(
+                row["low"]
+            )
+
+            close = float(
+                row["close"]
+            )
+
+            candle_range = (
+                high - low
+            )
+
+            zone_height = max(
+                zone.high -
+                zone.low,
+                0.01
+            )
+
+            max_range = max(
+                MAX_TOUCH_RANGE_ABSOLUTE,
+                zone_height *
+                MAX_TOUCH_RANGE_MULTIPLIER
+            )
+
+            if (
+                candle_range >
+                max_range
             ):
 
-                touch_idx = i
-                break
+                continue
 
-        if touch_idx is None:
+            close_distance = (
+                self.zone_distance_to_price(
+                    zone,
+                    close
+                )
+            )
+
+            max_close_distance = max(
+                MAX_TOUCH_CLOSE_DISTANCE_ABSOLUTE,
+                zone_height *
+                MAX_TOUCH_CLOSE_DISTANCE_MULTIPLIER
+            )
+
+            if (
+                close_distance >
+                max_close_distance
+            ):
+
+                continue
+
+            touch = i
+            touch_overlap = overlap
+
+            break
+
+        if touch is None:
 
             return {
-                "state": "WAITING",
-                "reason": "PRICE_NOT_IN_M15_POI",
-                "touch": None,
-                "sweep": None,
-                "structure": None,
-                "displacement": None,
-                "retest": None
+                "state":
+                    "WAITING",
+
+                "reason":
+                    "M5_POI_NOT_TOUCHED"
             }
 
         # --------------------------------------------------------
-        # M5 sweep.
+        # M5 SWEEP
         # --------------------------------------------------------
 
-        sweep_idx = (
-            self.find_m5_sweep_after_touch(
-                touch_idx,
-                direction
+        sweep = (
+            self.local_sweep_after_touch(
+                touch,
+                direction,
+                end - 1,
+                zone
             )
         )
 
-        if sweep_idx is None:
+        if sweep is None:
 
             return {
-                "state": "WATCHING_POI",
-                "reason": "WAIT_M5_LIQUIDITY_SWEEP",
-                "touch": touch_idx,
-                "sweep": None,
-                "structure": None,
-                "displacement": None,
-                "retest": None
+                "state":
+                    "POI_TOUCHED",
+
+                "reason":
+                    "WAIT_M5_LIQUIDITY_SWEEP",
+
+                "touch":
+                    touch,
+
+                "touch_overlap":
+                    touch_overlap
             }
 
         # --------------------------------------------------------
-        # M5 structure.
+        # M5 STRUCTURE
         # --------------------------------------------------------
 
         structure = (
-            self.find_m5_structure(
-                sweep_idx,
+            self.m5_structure_after(
+                sweep,
                 direction
             )
         )
@@ -2080,63 +2222,66 @@ class SMCSetupEngine:
         if structure is None:
 
             return {
-                "state": "LIQUIDITY_SWEPT",
-                "reason": "WAIT_M5_STRUCTURE_SHIFT",
-                "touch": touch_idx,
-                "sweep": sweep_idx,
-                "structure": None,
-                "displacement": None,
-                "retest": None
+                "state":
+                    "LIQUIDITY_SWEPT",
+
+                "reason":
+                    "WAIT_M5_STRUCTURE",
+
+                "touch":
+                    touch,
+
+                "touch_overlap":
+                    touch_overlap,
+
+                "sweep":
+                    sweep
+            }
+
+        structure_row = (
+            d.iloc[
+                structure.idx
+            ]
+        )
+
+        structure_distance = (
+            self.zone_distance_to_candle(
+                zone,
+                structure_row
+            )
+        )
+
+        if (
+            structure_distance >
+            MAX_M5_DISTANCE_FROM_POI
+        ):
+
+            return {
+                "state":
+                    "STRUCTURE_SHIFT",
+
+                "reason":
+                    "M5_STRUCTURE_TOO_FAR_FROM_POI",
+
+                "touch":
+                    touch,
+
+                "touch_overlap":
+                    touch_overlap,
+
+                "sweep":
+                    sweep,
+
+                "structure":
+                    structure.idx
             }
 
         # --------------------------------------------------------
-        # Make sure structure candle is still related to POI.
-        # --------------------------------------------------------
-
-        structure_row = df.iloc[
-            structure.idx
-        ]
-
-        if not self.row_touches_zone(
-            structure_row,
-            zone
-        ):
-
-            distance = min(
-                abs(
-                    float(
-                        structure_row["close"]
-                    )
-                    -
-                    zone.high
-                ),
-                abs(
-                    float(
-                        structure_row["close"]
-                    )
-                    -
-                    zone.low
-                )
-            )
-
-            if distance > MAX_M5_DISTANCE_FROM_POI:
-
-                return {
-                    "state": "STRUCTURE_SHIFT",
-                    "reason": "M5_STRUCTURE_TOO_FAR_FROM_POI",
-                    "touch": touch_idx,
-                    "sweep": sweep_idx,
-                    "structure": structure.idx,
-                    "displacement": None,
-                    "retest": None
-                }
-
-        # --------------------------------------------------------
-        # M5 displacement.
+        # M5 DISPLACEMENT
         # --------------------------------------------------------
 
         displacement = (
-            self.find_m5_displacement(
+            self.m5_displacement_after(
                 structure,
                 direction
             )
@@ -2145,88 +2290,134 @@ class SMCSetupEngine:
         if displacement is None:
 
             return {
-                "state": "STRUCTURE_SHIFT",
-                "reason": "WAIT_M5_DISPLACEMENT",
-                "touch": touch_idx,
-                "sweep": sweep_idx,
-                "structure": structure.idx,
-                "displacement": None,
-                "retest": None
+                "state":
+                    "STRUCTURE_SHIFT",
+
+                "reason":
+                    "WAIT_M5_DISPLACEMENT",
+
+                "touch":
+                    touch,
+
+                "touch_overlap":
+                    touch_overlap,
+
+                "sweep":
+                    sweep,
+
+                "structure":
+                    structure.idx
+            }
+
+        displacement_row = (
+            d.iloc[
+                displacement
+            ]
+        )
+
+        displacement_distance = (
+            self.zone_distance_to_candle(
+                zone,
+                displacement_row
+            )
+        )
+
+        if (
+            displacement_distance >
+            MAX_M5_DISTANCE_FROM_POI
+        ):
+
+            return {
+                "state":
+                    "DISPLACEMENT",
+
+                "reason":
+                    "M5_DISPLACEMENT_TOO_FAR_FROM_POI",
+
+                "touch":
+                    touch,
+
+                "touch_overlap":
+                    touch_overlap,
+
+                "sweep":
+                    sweep,
+
+                "structure":
+                    structure.idx,
+
+                "displacement":
+                    displacement
             }
 
         # --------------------------------------------------------
-        # M5 displacement must not be too far from POI.
+        # M5 RETEST
         # --------------------------------------------------------
 
-        displacement_row = df.iloc[
-            displacement
-        ]
-
-        if not self.row_touches_zone(
-            displacement_row,
-            zone
-        ):
-
-            distance = min(
-                abs(
-                    float(
-                        displacement_row["close"]
-                    )
-                    -
-                    zone.high
-                ),
-                abs(
-                    float(
-                        displacement_row["close"]
-                    )
-                    -
-                    zone.low
-                )
+        retest = (
+            self.retest_after(
+                displacement,
+                zone,
+                direction
             )
-
-            if distance > MAX_M5_DISTANCE_FROM_POI:
-
-                return {
-                    "state": "DISPLACEMENT",
-                    "reason": "M5_DISPLACEMENT_TOO_FAR_FROM_POI",
-                    "touch": touch_idx,
-                    "sweep": sweep_idx,
-                    "structure": structure.idx,
-                    "displacement": displacement,
-                    "retest": None
-                }
-
-        # --------------------------------------------------------
-        # RETEST.
-        # --------------------------------------------------------
-
-        retest = self.find_m5_retest(
-            displacement,
-            direction,
-            zone
         )
 
         if retest is None:
 
             return {
-                "state": "DISPLACEMENT",
-                "reason": "WAIT_M5_RETEST",
-                "touch": touch_idx,
-                "sweep": sweep_idx,
-                "structure": structure.idx,
-                "displacement": displacement,
-                "retest": None
+                "state":
+                    "DISPLACEMENT",
+
+                "reason":
+                    "WAIT_M5_RETEST",
+
+                "touch":
+                    touch,
+
+                "touch_overlap":
+                    touch_overlap,
+
+                "sweep":
+                    sweep,
+
+                "structure":
+                    structure.idx,
+
+                "displacement":
+                    displacement
             }
 
+        # --------------------------------------------------------
+        # COMPLETE
+        # --------------------------------------------------------
+
         return {
-            "state": "ENTRY_READY",
-            "reason": "COMPLETE_M5_CONFIRMATION",
-            "touch": touch_idx,
-            "sweep": sweep_idx,
-            "structure": structure.idx,
-            "displacement": displacement,
-            "retest": retest
+
+            "state":
+                "ENTRY_READY",
+
+            "reason":
+                "COMPLETE_SMC_SEQUENCE",
+
+            "touch":
+                touch,
+
+            "touch_overlap":
+                touch_overlap,
+
+            "sweep":
+                sweep,
+
+            "structure":
+                structure.idx,
+
+            "displacement":
+                displacement,
+
+            "retest":
+                retest
         }
+
 
     # ============================================================
     # BUILD SETUP
@@ -2237,48 +2428,39 @@ class SMCSetupEngine:
         direction
     ):
 
-        sweeps = self.get_sweeps(
+        sweeps = self.sweeps(
             direction
         )
 
         if not sweeps:
 
             return {
-                "direction": direction,
-                "state": "WAIT_LIQUIDITY",
-                "liquidity": None,
-                "structure": None,
-                "displacement": None,
-                "poi": None,
-                "m5": None,
-                "reason": "NO_LIQUIDITY_SWEEP"
+
+                "direction":
+                    direction,
+
+                "state":
+                    "WAIT_LIQUIDITY",
+
+                "reason":
+                    "NO_LIQUIDITY_SWEEP"
             }
 
-        sweeps = sorted(
-            sweeps,
-            key=lambda x: x.idx,
-            reverse=True
-        )
-
-        # --------------------------------------------------------
-        # Only examine recent candidates.
-        # --------------------------------------------------------
-
-        for sweep in sweeps[:20]:
+        # Try newest valid causal sequence.
+        for sweep in sweeps:
 
             structure = (
-                self.find_structure_after(
+                self.structure_after(
                     sweep,
                     direction
                 )
             )
 
             if structure is None:
-
                 continue
 
             displacement = (
-                self.find_displacement_after(
+                self.displacement_after(
                     structure,
                     direction
                 )
@@ -2287,75 +2469,120 @@ class SMCSetupEngine:
             if displacement is None:
 
                 return {
-                    "direction": direction,
-                    "state": "STRUCTURE_SHIFT",
-                    "liquidity": sweep,
-                    "structure": structure,
-                    "displacement": None,
-                    "poi": None,
-                    "m5": None,
-                    "reason": "WAIT_DISPLACEMENT"
+
+                    "direction":
+                        direction,
+
+                    "state":
+                        "STRUCTURE_SHIFT",
+
+                    "reason":
+                        "WAIT_DISPLACEMENT",
+
+                    "liquidity":
+                        sweep,
+
+                    "structure":
+                        structure
                 }
 
-            poi = self.find_poi(
-                displacement,
-                direction
+            poi = (
+                self.find_poi(
+                    displacement,
+                    direction
+                )
             )
 
             if poi is None:
 
                 return {
-                    "direction": direction,
-                    "state": "DISPLACEMENT",
-                    "liquidity": sweep,
-                    "structure": structure,
-                    "displacement": displacement,
-                    "poi": None,
-                    "m5": None,
-                    "reason": "WAIT_FRESH_POI"
+
+                    "direction":
+                        direction,
+
+                    "state":
+                        "DISPLACEMENT",
+
+                    "reason":
+                        "WAIT_FRESH_VALID_POI",
+
+                    "liquidity":
+                        sweep,
+
+                    "structure":
+                        structure,
+
+                    "displacement":
+                        displacement
                 }
 
-            m5 = self.confirm_m5(
-                poi,
-                direction
+            m5 = (
+                self.confirm_m5(
+                    poi,
+                    direction
+                )
             )
 
             return {
-                "direction": direction,
-                "state": "POI_ACTIVE",
-                "liquidity": sweep,
-                "structure": structure,
-                "displacement": displacement,
-                "poi": poi,
-                "m5": m5,
-                "reason": m5["reason"]
+
+                "direction":
+                    direction,
+
+                "state":
+                    "POI_ACTIVE",
+
+                "reason":
+                    m5.get(
+                        "reason",
+                        "WAITING"
+                    ),
+
+                "liquidity":
+                    sweep,
+
+                "structure":
+                    structure,
+
+                "displacement":
+                    displacement,
+
+                "poi":
+                    poi,
+
+                "m5":
+                    m5
             }
 
         return {
-            "direction": direction,
-            "state": "WAIT_LIQUIDITY",
-            "liquidity": sweeps[0],
-            "structure": None,
-            "displacement": None,
-            "poi": None,
-            "m5": None,
-            "reason": "NO_VALID_SMC_SEQUENCE"
+
+            "direction":
+                direction,
+
+            "state":
+                "WAIT_LIQUIDITY",
+
+            "reason":
+                "NO_VALID_SMC_SEQUENCE"
         }
 
+
     # ============================================================
-    # RUN
+    # RUN SETUP ENGINE
     # ============================================================
 
     def run(self):
 
         return {
-            "BUY": self.build_setup(
-                "BUY"
-            ),
 
-            "SELL": self.build_setup(
-                "SELL"
-            )
+            "BUY":
+                self.build_setup(
+                    "BUY"
+                ),
+
+            "SELL":
+                self.build_setup(
+                    "SELL"
+                )
         }
 
 
@@ -2365,34 +2592,26 @@ class SMCSetupEngine:
 
 def load_mt5_data():
 
-    print(
-        "CONNECTING TO MT5..."
-    )
-
     if not mt5.initialize():
 
         raise RuntimeError(
-            f"MT5 initialize gagal: "
+            "MT5 initialize gagal: "
             f"{mt5.last_error()}"
         )
 
-    print(
-        "MT5 CONNECTED"
-    )
-
-    symbol = mt5.symbol_info(
+    info = mt5.symbol_info(
         SYMBOL
     )
 
-    if symbol is None:
+    if info is None:
 
         mt5.shutdown()
 
         raise RuntimeError(
-            f"Symbol {SYMBOL} tidak ditemukan."
+            f"Symbol {SYMBOL} tidak ditemukan"
         )
 
-    if not symbol.visible:
+    if not info.visible:
 
         mt5.symbol_select(
             SYMBOL,
@@ -2400,6 +2619,7 @@ def load_mt5_data():
         )
 
     configs = {
+
         "H4": (
             mt5.TIMEFRAME_H4,
             H4_BARS
@@ -2421,16 +2641,12 @@ def load_mt5_data():
         )
     }
 
-    result = {}
+    output = {}
 
-    for tf_name, (
+    for name, (
         timeframe,
         bars
     ) in configs.items():
-
-        print(
-            f"Loading {tf_name}..."
-        )
 
         rates = mt5.copy_rates_from_pos(
             SYMBOL,
@@ -2439,245 +2655,228 @@ def load_mt5_data():
             bars
         )
 
-        if rates is None:
+        if (
+            rates is None
+            or
+            len(rates) < 20
+        ):
+
+            mt5.shutdown()
 
             raise RuntimeError(
-                f"Gagal mengambil "
-                f"{tf_name}: "
+                f"Gagal mengambil {name}: "
                 f"{mt5.last_error()}"
             )
 
-        if len(rates) < 20:
-
-            raise RuntimeError(
-                f"Data {tf_name} terlalu sedikit."
-            )
-
-        df = pd.DataFrame(
+        dataframe = pd.DataFrame(
             rates
         )
 
-        df["time"] = pd.to_datetime(
-            df["time"],
-            unit="s"
+        dataframe["time"] = (
+            pd.to_datetime(
+                dataframe["time"],
+                unit="s"
+            )
         )
 
-        # --------------------------------------------------------
-        # Remove current forming candle.
-        # --------------------------------------------------------
+        # IMPORTANT:
+        # Remove currently forming candle.
+        if len(dataframe) > 1:
 
-        if len(df) > 1:
+            dataframe = (
+                dataframe
+                .iloc[:-1]
+                .copy()
+            )
 
-            df = df.iloc[
-                :-1
-            ].copy()
-
-        df = df.reset_index(
-            drop=True
+        output[name] = (
+            dataframe
+            .reset_index(drop=True)
         )
 
-        result[
-            tf_name
-        ] = df
-
-        print(
-            f"{tf_name}: "
-            f"{len(df)} candles | "
-            f"{df.iloc[0]['time']} -> "
-            f"{df.iloc[-1]['time']}"
-        )
-
-    return result
+    return output
 
 
 # ================================================================
 # MARKET STATUS
 # ================================================================
 
-def get_market_status():
+def market_status():
 
     tick = mt5.symbol_info_tick(
         SYMBOL
     )
 
-    if tick is None:
+    now = pd.Timestamp.now()
 
-        return {
-            "market": "UNKNOWN",
-            "execution": "WAIT",
-            "bid": None,
-            "ask": None
-        }
-
-    now = datetime.now()
-
+    # Saturday / Sunday
     if now.weekday() >= 5:
 
         return {
-            "market": "MARKET_CLOSED",
-            "execution": "WAIT - MARKET CLOSED",
-            "bid": tick.bid,
-            "ask": tick.ask
+
+            "market":
+                "CLOSED",
+
+            "reason":
+                "WEEKEND",
+
+            "tick":
+                tick,
+
+            "time":
+                now
+        }
+
+    if tick is None:
+
+        return {
+
+            "market":
+                "CLOSED",
+
+            "reason":
+                "NO_TICK",
+
+            "tick":
+                None,
+
+            "time":
+                now
         }
 
     return {
-        "market": "OPEN",
-        "execution": "READY",
-        "bid": tick.bid,
-        "ask": tick.ask
+
+        "market":
+            "OPEN",
+
+        "reason":
+            "OK",
+
+        "tick":
+            tick,
+
+        "time":
+            now
     }
 
 
 # ================================================================
-# FORMAT DISPLACEMENT
+# FINAL SIGNAL
 # ================================================================
 
-def fmt_displacement(
-    engine,
-    idx,
-    direction
+def final_signal(
+    analysis,
+    market
 ):
 
-    if idx is None:
+    if market["market"] != "OPEN":
 
-        return "-"
+        return {
 
-    if not isinstance(
-        idx,
-        (int, np.integer)
+            "signal":
+                "WAIT",
+
+            "reason":
+                "MARKET_CLOSED"
+        }
+
+    # Only complete M5 sequence
+    # can produce an entry.
+    for direction in (
+        "BUY",
+        "SELL"
     ):
 
-        return "-"
+        setup = (
+            analysis.get(
+                direction,
+                {}
+            )
+        )
 
-    idx = int(
-        idx
-    )
+        m5 = (
+            setup.get(
+                "m5",
+                {}
+            )
+        )
 
-    if (
-        idx < 0
-        or
-        idx >= len(engine.df)
-    ):
+        if (
+            m5.get("state")
+            ==
+            "ENTRY_READY"
+        ):
 
-        return "-"
+            return {
 
-    row = engine.df.iloc[
-        idx
-    ]
+                "signal":
+                    direction,
 
-    return (
-        f"{direction} | "
-        f"{fmt_time(row['time'])} | "
-        f"Close "
-        f"{fmt_price(row['close'])}"
-    )
+                "reason":
+                    "COMPLETE_SMC_SEQUENCE"
+            }
 
+    return {
 
-# ================================================================
-# FORMAT ZONE
-# ================================================================
+        "signal":
+            "WAIT",
 
-def fmt_zone(
-    zone
-):
-
-    if zone is None:
-
-        return "-"
-
-    return (
-        f"{zone.zone_type} "
-        f"{fmt_price(zone.low)} - "
-        f"{fmt_price(zone.high)} "
-        f"[{zone.state}]"
-    )
+        "reason":
+            "NO_COMPLETE_SMC_SEQUENCE"
+    }
 
 
 # ================================================================
 # PRINT ENGINE
 # ================================================================
 
-def print_engine_stats(
+def print_engine(
+    name,
     engine
 ):
 
     stats = engine.stats()
 
-    print()
     print(
-        f"BUILDING SMC ENGINE "
-        f"{engine.timeframe}..."
-    )
-
-    print()
-
-    print(
-        f"{engine.timeframe} "
-        f"{stats['candles']}"
+        f"\n{name} "
+        f"{len(engine.df)} candles "
+        f"| Bias {engine.bias}"
     )
 
     print(
-        f" Swing High "
-        f"{stats['swing_high']}"
-    )
-
-    print(
-        f" Swing Low "
+        f" Swing H/L     : "
+        f"{stats['swing_high']}/"
         f"{stats['swing_low']}"
     )
 
     print(
-        f" BOS UP "
-        f"{stats['bos_up']}"
-    )
-
-    print(
-        f" BOS DOWN "
+        f" BOS UP/DOWN    : "
+        f"{stats['bos_up']}/"
         f"{stats['bos_down']}"
     )
 
     print(
-        f" CHoCH UP "
-        f"{stats['choch_up']}"
-    )
-
-    print(
-        f" CHoCH DOWN "
+        f" CHoCH UP/DOWN  : "
+        f"{stats['choch_up']}/"
         f"{stats['choch_down']}"
     )
 
     print(
-        f" Sweep High "
-        f"{stats['sweep_high']}"
-    )
-
-    print(
-        f" Sweep Low "
+        f" Sweep H/L      : "
+        f"{stats['sweep_high']}/"
         f"{stats['sweep_low']}"
     )
 
     print(
-        f" FVG "
-        f"{stats['fvg']}"
-    )
-
-    print(
-        f" OB "
+        f" FVG / OB       : "
+        f"{stats['fvg']} / "
         f"{stats['ob']}"
     )
 
     print(
-        f" Active Zones "
-        f"{stats['active_zones']}"
-    )
-
-    print(
-        f" Mitigated Zones "
-        f"{stats['mitigated_zones']}"
-    )
-
-    print(
-        f" Invalidated Zones "
+        f" Zones A/M/I    : "
+        f"{stats['active_zones']}/"
+        f"{stats['mitigated_zones']}/"
         f"{stats['invalidated_zones']}"
     )
 
@@ -2693,293 +2892,241 @@ def print_setup(
     m5_engine
 ):
 
-    print()
     print(
-        f"{direction} M15 SETUP"
-    )
-
-    print(
-        f" STATE       : "
-        f"{setup.get('state', '-')}"
+        f"\n{direction} M15 SETUP"
     )
 
     print(
-        f" REASON      : "
-        f"{setup.get('reason', '-')}"
+        f" STATE          : "
+        f"{setup.get('state')}"
     )
 
-    liquidity = setup.get(
-        "liquidity"
+    print(
+        f" REASON         : "
+        f"{setup.get('reason')}"
     )
 
-    if liquidity is not None:
+    # ------------------------------------------------------------
+    # M15 LIQUIDITY
+    # ------------------------------------------------------------
+
+    liquidity = (
+        setup.get("liquidity")
+    )
+
+    if liquidity:
 
         print(
-            f" LIQUIDITY   : "
+            f" LIQUIDITY      : "
             f"{fmt_time(liquidity.time)} "
-            f"@ "
-            f"{fmt_price(liquidity.price)}"
+            f"@ {fmt_price(liquidity.price)}"
         )
 
-    structure = setup.get(
-        "structure"
+    # ------------------------------------------------------------
+    # M15 STRUCTURE
+    # ------------------------------------------------------------
+
+    structure = (
+        setup.get("structure")
     )
 
-    if structure is not None:
+    if structure:
 
         print(
-            f" STRUCTURE   : "
+            f" STRUCTURE      : "
             f"{structure.event} "
-            f"@ "
-            f"{fmt_time(structure.time)} "
-            f"Price "
-            f"{fmt_price(structure.price)}"
+            f"@ {fmt_time(structure.time)} "
+            f"Price {fmt_price(structure.price)}"
         )
 
-    displacement = setup.get(
-        "displacement"
+    # ------------------------------------------------------------
+    # M15 DISPLACEMENT
+    # ------------------------------------------------------------
+
+    displacement = (
+        setup.get("displacement")
     )
 
-    print(
-        " DISPLACEMENT: "
-        +
-        fmt_displacement(
-            m15_engine,
-            displacement,
-            direction
-        )
-    )
+    if displacement is not None:
 
-    poi = setup.get(
-        "poi"
-    )
-
-    if poi is not None:
-
-        print(
-            f" POI         : "
-            f"{fmt_zone(poi)}"
-        )
-
-    m5 = setup.get(
-        "m5"
-    )
-
-    if m5 is None:
-
-        print(
-            " M5 STATE    : WAITING"
+        row = (
+            m15_engine.df.iloc[
+                int(displacement)
+            ]
         )
 
         print(
-            " M5 REASON   : "
-            "M15_POI_NOT_READY"
-        )
-
-        return
-
-    print(
-        f" M5 STATE    : "
-        f"{m5.get('state', '-')}"
-    )
-
-    print(
-        f" M5 REASON   : "
-        f"{m5.get('reason', '-')}"
-    )
-
-    touch = m5.get(
-        "touch"
-    )
-
-    if touch is not None:
-
-        row = m5_engine.df.iloc[
-            int(touch)
-        ]
-
-        print(
-            f" M5 POI TOUCH: "
+            f" DISPLACEMENT   : "
             f"{fmt_time(row['time'])} "
-            f"@ "
+            f"| Close "
             f"{fmt_price(row['close'])}"
         )
 
-    sweep = m5.get(
-        "sweep"
+    # ------------------------------------------------------------
+    # POI
+    # ------------------------------------------------------------
+
+    zone = (
+        setup.get("poi")
     )
 
-    if sweep is not None:
-
-        row = m5_engine.df.iloc[
-            int(sweep)
-        ]
+    if zone:
 
         print(
-            f" M5 SWEEP    : "
-            f"{fmt_time(row['time'])} "
-            f"@ "
-            f"{fmt_price(row['close'])}"
+            f" POI            : "
+            f"{zone.zone_type} "
+            f"{fmt_price(zone.low)} - "
+            f"{fmt_price(zone.high)} "
+            f"[{zone.state}]"
         )
 
-    structure_idx = m5.get(
-        "structure"
+    # ------------------------------------------------------------
+    # M5
+    # ------------------------------------------------------------
+
+    m5 = (
+        setup.get("m5")
+        or {}
     )
 
-    if structure_idx is not None:
+    if m5:
 
-        event = next(
-            (
-                e for e in m5_engine.structure
-                if e.idx == structure_idx
-            ),
-            None
+        print(
+            f" M5 STATE       : "
+            f"{m5.get('state')}"
         )
 
-        if event is not None:
+        print(
+            f" M5 REASON      : "
+            f"{m5.get('reason')}"
+        )
+
+        # --------------------------------------------------------
+        # M5 POI TOUCH
+        # --------------------------------------------------------
+
+        touch = (
+            m5.get("touch")
+        )
+
+        if touch is not None:
+
+            row = (
+                m5_engine.df.iloc[
+                    int(touch)
+                ]
+            )
 
             print(
-                f" M5 STRUCTURE : "
-                f"{event.event} "
-                f"@ "
-                f"{fmt_time(event.time)} "
-                f"Price "
-                f"{fmt_price(event.price)}"
+                f" M5 POI TOUCH   : "
+                f"{fmt_time(row['time'])} "
+                f"H {fmt_price(row['high'])} "
+                f"L {fmt_price(row['low'])} "
+                f"C {fmt_price(row['close'])} "
+                f"overlap "
+                f"{fmt_price(m5.get('touch_overlap'))}"
             )
 
-    displacement_idx = m5.get(
-        "displacement"
-    )
+        # --------------------------------------------------------
+        # M5 SWEEP
+        # --------------------------------------------------------
 
-    if displacement_idx is not None:
+        sweep = (
+            m5.get("sweep")
+        )
 
-        print(
-            " M5 DISPLACE : "
-            +
-            fmt_displacement(
-                m5_engine,
-                displacement_idx,
-                direction
+        if sweep is not None:
+
+            row = (
+                m5_engine.df.iloc[
+                    int(sweep)
+                ]
             )
+
+            print(
+                f" M5 SWEEP       : "
+                f"{fmt_time(row['time'])} "
+                f"H {fmt_price(row['high'])} "
+                f"L {fmt_price(row['low'])} "
+                f"C {fmt_price(row['close'])}"
+            )
+
+        # --------------------------------------------------------
+        # M5 STRUCTURE
+        # --------------------------------------------------------
+
+        structure_idx = (
+            m5.get("structure")
         )
 
-    retest = m5.get(
-        "retest"
-    )
+        if structure_idx is not None:
 
-    if retest is not None:
+            event = next(
+                (
+                    event
+                    for event
+                    in m5_engine.structure
+                    if event.idx ==
+                    int(structure_idx)
+                ),
+                None
+            )
 
-        row = m5_engine.df.iloc[
-            int(retest)
-        ]
+            if event:
 
-        print(
-            f" M5 RETEST   : "
-            f"{fmt_time(row['time'])} "
-            f"@ "
-            f"{fmt_price(row['close'])}"
+                print(
+                    f" M5 STRUCTURE   : "
+                    f"{event.event} "
+                    f"@ {fmt_time(event.time)} "
+                    f"Price {fmt_price(event.price)}"
+                )
+
+        # --------------------------------------------------------
+        # M5 DISPLACEMENT
+        # --------------------------------------------------------
+
+        displacement_idx = (
+            m5.get("displacement")
         )
 
+        if displacement_idx is not None:
 
-# ================================================================
-# PRINT EVENTS
-# ================================================================
+            row = (
+                m5_engine.df.iloc[
+                    int(displacement_idx)
+                ]
+            )
 
-def print_last_events(
-    engine,
-    count=15
-):
+            print(
+                f" M5 DISPLACE    : "
+                f"{fmt_time(row['time'])} "
+                f"Close "
+                f"{fmt_price(row['close'])}"
+            )
 
-    print()
-    print(
-        f"===== "
-        f"{engine.timeframe} "
-        f"LAST {count} EVENTS "
-        f"====="
-    )
+        # --------------------------------------------------------
+        # M5 RETEST
+        # --------------------------------------------------------
 
-    events = engine.events[
-        -count:
-    ]
-
-    if not events:
-
-        print(
-            "No events."
+        retest = (
+            m5.get("retest")
         )
 
-        return
+        if retest is not None:
 
-    for event in events:
+            row = (
+                m5_engine.df.iloc[
+                    int(retest)
+                ]
+            )
 
-        print(
-            f"{fmt_time(event.time)} | "
-            f"{event.event:<25} | "
-            f"{event.direction:<4} | "
-            f"{fmt_price(event.price)}"
-        )
-
-
-# ================================================================
-# FINAL SIGNAL
-# ================================================================
-
-def final_signal(
-    analysis,
-    market
-):
-
-    # ------------------------------------------------------------
-    # Never execute during closed market.
-    # ------------------------------------------------------------
-
-    if market["market"] != "OPEN":
-
-        return {
-            "signal": "WAIT",
-            "reason": "MARKET_CLOSED"
-        }
-
-    buy = analysis["BUY"]
-
-    sell = analysis["SELL"]
-
-    # ------------------------------------------------------------
-    # BUY
-    # ------------------------------------------------------------
-
-    if (
-        buy.get("m5") is not None
-        and
-        buy["m5"].get("state")
-        == "ENTRY_READY"
-    ):
-
-        return {
-            "signal": "BUY",
-            "reason": "COMPLETE_SMC_SEQUENCE"
-        }
-
-    # ------------------------------------------------------------
-    # SELL
-    # ------------------------------------------------------------
-
-    if (
-        sell.get("m5") is not None
-        and
-        sell["m5"].get("state")
-        == "ENTRY_READY"
-    ):
-
-        return {
-            "signal": "SELL",
-            "reason": "COMPLETE_SMC_SEQUENCE"
-        }
-
-    return {
-        "signal": "WAIT",
-        "reason": "NO_COMPLETE_SMC_SEQUENCE"
-    }
+            print(
+                f" M5 RETEST      : "
+                f"{fmt_time(row['time'])} "
+                f"H {fmt_price(row['high'])} "
+                f"L {fmt_price(row['low'])} "
+                f"C {fmt_price(row['close'])}"
+            )
 
 
 # ================================================================
@@ -2989,402 +3136,199 @@ def final_signal(
 def main():
 
     print(
-        "=" * 70
+        "=" * 72
     )
 
     print(
-        "AI MT5 TRADER"
+        "AI MT5 TRADER - "
+        "SMC ENGINE V4.3.11"
     )
 
     print(
-        "SMC ENGINE V4.3.9"
+        "SMART MONEY CONCEPT ONLY "
+        "| CLOSED CANDLES ONLY"
     )
 
     print(
-        "SMART MONEY CONCEPT ONLY"
-    )
-
-    print(
-        "=" * 70
-    )
-
-    print()
-
-    print(
-        "H4  = EXTERNAL MAPPING"
-    )
-
-    print(
-        "H1  = MAPPING / POI"
-    )
-
-    print(
-        "M15 = SETUP"
-    )
-
-    print(
-        "M5  = ENTRY CONFIRMATION"
-    )
-
-    print(
-        "CLOSED CANDLES ONLY"
-    )
-
-    print(
-        "CAUSAL SWINGS"
-    )
-
-    print(
-        "PERSISTENT POI"
-    )
-
-    print(
-        "NO POI AGE EXPIRATION"
-    )
-
-    print(
-        "M5 MUST TOUCH M15 POI"
-    )
-
-    print(
-        "NO EMA / RSI / MACD / ATR"
-    )
-
-    print(
-        "=" * 70
+        "=" * 72
     )
 
     try:
 
+        # --------------------------------------------------------
+        # LOAD DATA
+        # --------------------------------------------------------
+
         data = load_mt5_data()
 
-        # ========================================================
-        # H4
-        # ========================================================
+        # --------------------------------------------------------
+        # BUILD SMC ENGINES
+        # --------------------------------------------------------
 
-        h4 = SMCEngine(
+        engines = {
+
+            timeframe:
+                SMCEngine(
+                    timeframe,
+                    data[timeframe]
+                ).run()
+
+            for timeframe
+            in (
+                "H4",
+                "H1",
+                "M15",
+                "M5"
+            )
+        }
+
+        # --------------------------------------------------------
+        # PRINT STATISTICS
+        # --------------------------------------------------------
+
+        for timeframe in (
             "H4",
-            data["H4"]
-        ).run()
-
-        print_engine_stats(
-            h4
-        )
-
-        # ========================================================
-        # H1
-        # ========================================================
-
-        h1 = SMCEngine(
             "H1",
-            data["H1"]
-        ).run()
-
-        print_engine_stats(
-            h1
-        )
-
-        # ========================================================
-        # M15
-        # ========================================================
-
-        m15 = SMCEngine(
             "M15",
-            data["M15"]
-        ).run()
+            "M5"
+        ):
 
-        print_engine_stats(
-            m15
-        )
+            print_engine(
+                timeframe,
+                engines[timeframe]
+            )
 
-        # ========================================================
-        # M5
-        # ========================================================
+        # --------------------------------------------------------
+        # SETUP ENGINE
+        # --------------------------------------------------------
 
-        m5 = SMCEngine(
-            "M5",
-            data["M5"]
-        ).run()
-
-        print_engine_stats(
-            m5
-        )
-
-        # ========================================================
-        # SETUP
-        # ========================================================
-
-        setup_engine = SMCSetupEngine(
-            h4,
-            h1,
-            m15,
-            m5
+        setup_engine = (
+            SMCSetupEngine(
+                engines["H4"],
+                engines["H1"],
+                engines["M15"],
+                engines["M5"]
+            )
         )
 
         analysis = (
             setup_engine.run()
         )
 
-        # ========================================================
-        # MARKET STATE
-        # ========================================================
-
-        print()
-        print(
-            "=" * 70
-        )
-
-        print(
-            "SMC MARKET STATE"
-        )
-
-        print(
-            "=" * 70
-        )
-
-        h4_last = h4.df.iloc[
-            -1
-        ]
-
-        h1_last = h1.df.iloc[
-            -1
-        ]
-
-        m15_last = m15.df.iloc[
-            -1
-        ]
-
-        m5_last = m5.df.iloc[
-            -1
-        ]
-
-        print(
-            f"H4   "
-            f"{fmt_time(h4_last['time'])} "
-            f"Close "
-            f"{fmt_price(h4_last['close'])} "
-            f"Bias "
-            f"{h4.bias}"
-        )
-
-        print(
-            f"H1   "
-            f"{fmt_time(h1_last['time'])} "
-            f"Close "
-            f"{fmt_price(h1_last['close'])} "
-            f"Bias "
-            f"{h1.bias}"
-        )
-
-        print(
-            f"M15  "
-            f"{fmt_time(m15_last['time'])} "
-            f"Close "
-            f"{fmt_price(m15_last['close'])} "
-            f"Bias "
-            f"{m15.bias}"
-        )
-
-        print(
-            f"M5   "
-            f"{fmt_time(m5_last['time'])} "
-            f"Close "
-            f"{fmt_price(m5_last['close'])} "
-            f"Bias "
-            f"{m5.bias}"
-        )
-
-        # ========================================================
-        # SETUPS
-        # ========================================================
+        # --------------------------------------------------------
+        # PRINT SETUPS
+        # --------------------------------------------------------
 
         print_setup(
             "BUY",
             analysis["BUY"],
-            m15,
-            m5
+            engines["M15"],
+            engines["M5"]
         )
 
         print_setup(
             "SELL",
             analysis["SELL"],
-            m15,
-            m5
+            engines["M15"],
+            engines["M5"]
         )
 
-        # ========================================================
-        # EVENTS
-        # ========================================================
-
-        print_last_events(
-            h4,
-            15
-        )
-
-        print_last_events(
-            h1,
-            15
-        )
-
-        print_last_events(
-            m15,
-            15
-        )
-
-        print_last_events(
-            m5,
-            15
-        )
-
-        # ========================================================
+        # --------------------------------------------------------
         # MARKET
-        # ========================================================
+        # --------------------------------------------------------
 
-        status = get_market_status()
-
-        print()
-        print(
-            "=" * 70
+        market = (
+            market_status()
         )
 
         print(
-            "CURRENT PRICE"
+            "\nMARKET"
         )
 
         print(
-            "=" * 70
+            f" STATUS         : "
+            f"{market['market']} "
+            f"({market['reason']})"
+        )
+
+        tick = market.get(
+            "tick"
+        )
+
+        if tick:
+
+            print(
+                f" BID/ASK        : "
+                f"{tick.bid:.2f} / "
+                f"{tick.ask:.2f}"
+            )
+
+        print(
+            f" TIME           : "
+            f"{fmt_time(market['time'])}"
+        )
+
+        # --------------------------------------------------------
+        # FINAL SIGNAL
+        # --------------------------------------------------------
+
+        signal = (
+            final_signal(
+                analysis,
+                market
+            )
         )
 
         print(
-            f"BID : "
-            f"{fmt_price(status['bid'])}"
+            f"\nFINAL SIGNAL    : "
+            f"{signal['signal']}"
         )
 
         print(
-            f"ASK : "
-            f"{fmt_price(status['ask'])}"
-        )
-
-        print(
-            f"TIME: "
-            f"{datetime.now()}"
-        )
-
-        # ========================================================
-        # FINAL
-        # ========================================================
-
-        result = final_signal(
-            analysis,
-            status
-        )
-
-        print()
-        print(
-            "=" * 70
-        )
-
-        print(
-            "SMC FINAL ANALYSIS"
-        )
-
-        print(
-            "=" * 70
-        )
-
-        print(
-            f"SIGNAL : "
-            f"{result['signal']}"
-        )
-
-        print(
-            f"REASON : "
-            f"{result['reason']}"
-        )
-
-        print(
-            f"MARKET : "
-            f"{status['market']}"
+            f"REASON          : "
+            f"{signal['reason']}"
         )
 
         if (
-            status["market"]
-            ==
-            "MARKET_CLOSED"
+            market["market"]
+            !=
+            "OPEN"
         ):
 
             print(
-                "EXECUTION : "
+                "EXECUTION       : "
                 "WAIT - MARKET CLOSED"
-            )
-
-        elif result["signal"] == "BUY":
-
-            print(
-                "EXECUTION : BUY READY"
-            )
-
-        elif result["signal"] == "SELL":
-
-            print(
-                "EXECUTION : SELL READY"
             )
 
         else:
 
             print(
-                "EXECUTION : WAIT"
+                f"EXECUTION       : "
+                f"{signal['signal']}"
             )
 
+    except Exception as error:
+
         print(
-            "=" * 70
-        )
-
-    except KeyboardInterrupt:
-
-        print()
-        print(
-            "Program dihentikan user."
-        )
-
-    except Exception as e:
-
-        print()
-        print(
-            "=" * 70
+            "\nERROR:"
         )
 
         print(
-            "ERROR"
+            f"{type(error).__name__}: "
+            f"{error}"
         )
 
-        print(
-            "=" * 70
-        )
-
-        print(
-            str(e)
-        )
-
-        import traceback
-
-        traceback.print_exc()
-
-        return 1
+        raise
 
     finally:
 
         mt5.shutdown()
 
-    return 0
-
 
 # ================================================================
-# ENTRY
+# ENTRY POINT
 # ================================================================
 
 if __name__ == "__main__":
 
-    sys.exit(
-        main()
-    )
+    main()
